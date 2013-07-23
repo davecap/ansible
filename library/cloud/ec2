@@ -184,6 +184,14 @@ options:
     required: false
     default: 'present'
     aliases: []
+  ebs_optimized:
+    version_Added: "1.3"
+    description:
+      - enable EBS optimization for instance
+    required: false
+    default: "no"
+    choices: [ "yes", "no" ]
+    aliases: []
 
 requirements: [ "boto" ]
 author: Seth Vidal, Tim Gerla, Lester Wade
@@ -317,7 +325,8 @@ def get_instance_info(inst):
         'root_device_type': inst.root_device_type,
         'root_device_name': inst.root_device_name,
         'state': inst.state,
-        'hypervisor': inst.hypervisor
+        'hypervisor': inst.hypervisor,
+        'ebs_optimized': inst.ebs_optimized
     })
 
 
@@ -352,7 +361,7 @@ def create_instances(module, ec2):
     vpc_subnet_id = module.params.get('vpc_subnet_id')
     private_ip = module.params.get('private_ip')
     instance_profile_name = module.params.get('instance_profile_name')
-
+    ebs_optimized = module.params.get('ebs_optimized')
 
     # Here we try to lookup the group name from the security group id - if group_id is set.
     if group_id and group_name:
@@ -409,7 +418,8 @@ def create_instances(module, ec2):
                       'subnet_id': vpc_subnet_id,
                       'private_ip_address': private_ip,
                       'user_data': user_data,
-                      'instance_profile_name': instance_profile_name}
+                      'instance_profile_name': instance_profile_name,
+                      'ebs_optimized': ebs_optimized}
 
             if vpc_subnet_id:
                 params['security_group_ids'] = group_id
@@ -532,6 +542,7 @@ def main():
             instance_profile_name = dict(),
             instance_ids = dict(type='list'),
             state = dict(default='present'),
+            ebs_optimized = dict(choices=BOOLEANS, default="no"),
         )
     )
 
