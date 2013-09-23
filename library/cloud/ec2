@@ -451,7 +451,6 @@ def create_instances(module, ec2):
                       'subnet_id': vpc_subnet_id,
                       'private_ip_address': private_ip,
                       'user_data': user_data,
-                      'instance_profile_name': instance_profile_name,
                       'ebs_optimized': ebs_optimized}
 
             if boto_supports_profile_name_arg(ec2):
