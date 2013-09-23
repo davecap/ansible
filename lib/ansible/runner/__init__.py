@@ -37,6 +37,7 @@ import ansible.constants as C
 import ansible.inventory
 from ansible import utils
 from ansible.utils import template
+from ansible.utils import check_conditional
 from ansible import errors
 from ansible import module_common
 import poller
@@ -86,19 +87,16 @@ class HostVars(dict):
     def __init__(self, setup_cache, inventory):
         self.setup_cache = setup_cache
         self.inventory = inventory
-        self.lookup = {}
-
+        self.lookup = dict()
         self.update(setup_cache)
 
     def __getitem__(self, host):
-        if not host in self.lookup:
+        if host not in self.lookup:
             result = self.inventory.get_variables(host)
             result.update(self.setup_cache.get(host, {}))
             self.lookup[host] = result
         return self.lookup[host]
 
-    def __contains__(self, host):
-        return host in self.lookup or host in self.setup_cache or self.inventory.get_host(host)
 
 class Runner(object):
     ''' core API interface to ansible '''
@@ -127,6 +125,7 @@ class Runner(object):
         sudo=False,                         # whether to run sudo or not
         sudo_user=C.DEFAULT_SUDO_USER,      # ex: 'root'
         module_vars=None,                   # a playbooks internals thing
+        default_vars=None,                  # ditto
         is_playbook=False,                  # running from playbook or not?
         inventory=None,                     # reference to Inventory object
         subset=None,                        # subset pattern
@@ -134,7 +133,9 @@ class Runner(object):
         diff=False,                         # whether to show diffs for template files that change
         environment=None,                   # environment variables (as dict) to use inside the command
         complex_args=None,                  # structured data in addition to module_args, must be a dict
-        error_on_undefined_vars=C.DEFAULT_UNDEFINED_VAR_BEHAVIOR # ex. False
+        error_on_undefined_vars=C.DEFAULT_UNDEFINED_VAR_BEHAVIOR, # ex. False
+        accelerate=False,                   # use accelerated connection
+        accelerate_port=None,               # port to use with accelerated connection
         ):
 
         # used to lock multiprocess inputs and outputs at various levels
@@ -155,6 +156,8 @@ class Runner(object):
         self.inventory        = utils.default(inventory, lambda: ansible.inventory.Inventory(host_list))
 
         self.module_vars      = utils.default(module_vars, lambda: {})
+        self.default_vars     = utils.default(default_vars, lambda: {})
+        self.always_run       = None
         self.connector        = connection.Connection(self)
         self.conditional      = conditional
         self.module_name      = module_name
@@ -174,11 +177,14 @@ class Runner(object):
         self.environment      = environment
         self.complex_args     = complex_args
         self.error_on_undefined_vars = error_on_undefined_vars
+        self.accelerate       = accelerate
+        self.accelerate_port  = accelerate_port
         self.callbacks.runner = self
+        self.original_transport = self.transport
 
-        # if the transport is 'smart' see if SSH can support ControlPersist if not use paramiko
-        # 'smart' is the default since 1.2.1/1.3
         if self.transport == 'smart':
+            # if the transport is 'smart' see if SSH can support ControlPersist if not use paramiko
+            # 'smart' is the default since 1.2.1/1.3
             cmd = subprocess.Popen(['ssh','-o','ControlPersist'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             (out, err) = cmd.communicate() 
             if "Bad configuration option" in err:
@@ -333,7 +339,14 @@ class Runner(object):
             if not self.sudo or self.sudo_user == 'root':
                 # not sudoing or sudoing to root, so can cleanup files in the same step
                 cmd = cmd + "; rm -rf %s >/dev/null 2>&1" % tmp
-        res = self._low_level_exec_command(conn, cmd, tmp, sudoable=True)
+
+        sudoable = True
+        if module_name == "accelerate":
+            # always run the accelerate module as the user
+            # specified in the play, not the sudo_user
+            sudoable = False
+
+        res = self._low_level_exec_command(conn, cmd, tmp, sudoable=sudoable)
 
         if self.sudo and self.sudo_user != 'root':
             # not sudoing to root, so maybe can't delete files as that other user
@@ -362,7 +375,10 @@ class Runner(object):
             return flags
 
         try:
-            self._new_stdin = new_stdin
+            if not new_stdin:
+                self._new_stdin = os.fdopen(os.dup(sys.stdin.fileno()))
+            else:
+                self._new_stdin = new_stdin
 
             exec_rc = self._executor_internal(host, new_stdin)
             if type(exec_rc) != ReturnData:
@@ -388,7 +404,7 @@ class Runner(object):
 
         host_variables = self.inventory.get_variables(host)
         host_connection = host_variables.get('ansible_connection', self.transport)
-        if host_connection in [ 'paramiko', 'ssh' ]:
+        if host_connection in [ 'paramiko', 'ssh', 'accelerate' ]:
             port = host_variables.get('ansible_ssh_port', self.remote_port)
             if port is None:
                 port = C.DEFAULT_REMOTE_PORT
@@ -397,6 +413,7 @@ class Runner(object):
             port = self.remote_port
 
         inject = {}
+        inject = utils.combine_vars(inject, self.default_vars)
         inject = utils.combine_vars(inject, host_variables)
         inject = utils.combine_vars(inject, self.module_vars)
         inject = utils.combine_vars(inject, self.setup_cache[host])
@@ -405,10 +422,14 @@ class Runner(object):
         inject['group_names'] = host_variables.get('group_names', [])
         inject['groups']      = self.inventory.groups_list()
         inject['vars']        = self.module_vars
+        inject['defaults']    = self.default_vars
         inject['environment'] = self.environment
 
         if self.inventory.basedir() is not None:
             inject['inventory_dir'] = self.inventory.basedir()
+
+        if self.inventory.src() is not None:
+            inject['inventory_file'] = self.inventory.src()
 
         # late processing of parameterized sudo_user
         if self.sudo_user is not None:
@@ -454,6 +475,9 @@ class Runner(object):
             # executing using with_items, so make multiple calls
             # TODO: refactor
 
+            if self.background > 0:
+                raise errors.AnsibleError("lookup plugins (with_*) cannot be used with async tasks")
+
             aggregrate = {}
             all_comm_ok = True
             all_changed = False
@@ -463,8 +487,8 @@ class Runner(object):
                 inject['item'] = x
 
                 # TODO: this idiom should be replaced with an up-conversion to a Jinja2 template evaluation
-                if isinstance(complex_args, basestring):
-                    complex_args = template.template(self.basedir, complex_args, inject, convert_bare=True)
+                if isinstance(self.complex_args, basestring):
+                    complex_args = template.template(self.basedir, self.complex_args, inject, convert_bare=True)
                     complex_args = utils.safe_eval(complex_args)
                     if type(complex_args) != dict:
                         raise errors.AnsibleError("args must be a dictionary, received %s" % complex_args)
@@ -484,7 +508,7 @@ class Runner(object):
                 for x in results:
                     if x.get('changed') == True:
                         all_changed = True
-                    if (x.get('failed') == True) or (('rc' in x) and (x['rc'] != 0)):
+                    if (x.get('failed') == True) or ('failed_when_result' in x and [x['failed_when_result']] or [('rc' in x) and (x['rc'] != 0)])[0]:
                         all_failed = True
                         break
             msg = 'All items completed'
@@ -534,6 +558,8 @@ class Runner(object):
                 self.callbacks.on_skipped(host, inject.get('item',None))
                 return ReturnData(host=host, result=result)
 
+        if getattr(handler, 'setup', None) is not None:
+            handler.setup(module_name, inject)
         conn = None
         actual_host = inject.get('ansible_ssh_host', host)
         # allow ansible_ssh_host to be templated
@@ -543,7 +569,15 @@ class Runner(object):
         actual_pass = inject.get('ansible_ssh_pass', self.remote_pass)
         actual_transport = inject.get('ansible_connection', self.transport)
         actual_private_key_file = inject.get('ansible_ssh_private_key_file', self.private_key_file)
-        if actual_transport in [ 'paramiko', 'ssh' ]:
+
+        if self.accelerate and actual_transport != 'local':
+            # if we're using accelerated mode, force the
+            # transport to accelerate
+            actual_transport = "accelerate"
+            if not self.accelerate_port:
+                self.accelerate_port = C.ACCELERATE_PORT
+
+        if actual_transport in [ 'paramiko', 'ssh', 'accelerate' ]:
             actual_port = inject.get('ansible_ssh_port', port)
 
         # the delegated host may have different SSH port configured, etc
@@ -584,8 +618,13 @@ class Runner(object):
         inject['ansible_ssh_user'] = actual_user
 
         try:
-            if actual_port is not None:
-                actual_port = int(actual_port)
+            if actual_transport == 'accelerate':
+                # for accelerate, we stuff both ports into a single
+                # variable so that we don't have to mangle other function
+                # calls just to accomodate this one case
+                actual_port = [actual_port, self.accelerate_port]
+            elif actual_port is not None:
+                actual_port = int(template.template(self.basedir, actual_port, inject))
         except ValueError, e:
             result = dict(failed=True, msg="FAILED: Configured port \"%s\" is not a valid port, expected integer" % actual_port)
             return ReturnData(host=host, comm_ok=False, result=result)
@@ -631,13 +670,17 @@ class Runner(object):
             )
 
             changed_when = self.module_vars.get('changed_when')
-            if changed_when is not None:
+            failed_when = self.module_vars.get('failed_when')
+            if changed_when is not None or failed_when is not None:
                 register = self.module_vars.get('register')
                 if  register is not None:
                     if 'stdout' in data:
                         data['stdout_lines'] = data['stdout'].splitlines()
                     inject[register] = data
-                data['changed'] = utils.check_conditional(changed_when, self.basedir, inject, fail_on_undefined=self.error_on_undefined_vars)
+                if changed_when is not None:
+                    data['changed'] = utils.check_conditional(changed_when, self.basedir, inject, fail_on_undefined=self.error_on_undefined_vars)
+                if failed_when is not None:
+                    data['failed_when_result'] = data['failed'] = utils.check_conditional(failed_when, self.basedir, inject, fail_on_undefined=self.error_on_undefined_vars)
 
             if is_chained:
                 # no callbacks
@@ -694,7 +737,8 @@ class Runner(object):
             "(/usr/bin/digest -a md5 %s 2>/dev/null)" % path,   # Solaris 10+
             "(/sbin/md5 -q %s 2>/dev/null)" % path,     # Freebsd
             "(/usr/bin/md5 -n %s 2>/dev/null)" % path,  # Netbsd
-            "(/bin/md5 -q %s 2>/dev/null)" % path       # Openbsd
+            "(/bin/md5 -q %s 2>/dev/null)" % path,      # Openbsd
+            "(/usr/bin/csum -h MD5 %s 2>/dev/null)" % path # AIX
         ]
 
         cmd = " || ".join(md5s)
@@ -731,7 +775,15 @@ class Runner(object):
 
         # error handling on this seems a little aggressive?
         if result['rc'] != 0:
-            output = 'could not create temporary directory, SSH (%s) exited with result %d' % (cmd, result['rc'])
+            if result['rc'] == 5:
+                output = 'Authentication failure.'
+            elif result['rc'] == 255 and self.transport == 'ssh':
+                if utils.VERBOSITY > 3:
+                    output = 'SSH encountered an unknown error. The output was:\n%s' % (result['stdout']+result['stderr'])
+                else:
+                    output = 'SSH encountered an unknown error during the connection. We recommend you re-run the command using -vvvv, which will enable SSH debugging output to help diagnose the issue'
+            else:
+                output = 'Authentication or permission failure.  In some cases, you may have been able to authenticate and did not have permissions on the remote directory. Consider changing the remote temp path in ansible.cfg to a path rooted in "/tmp". Failed command was: %s, exited with result %d' % (cmd, result['rc'])
             if 'stdout' in result and result['stdout'] != '':
                 output = output + ": %s" % result['stdout']
             raise errors.AnsibleError(output)
@@ -886,6 +938,9 @@ class Runner(object):
         # host.
         p = utils.plugins.action_loader.get(self.module_name, self)
 
+        if self.forks == 0 or self.forks > len(hosts):
+            self.forks = len(hosts)
+
         if p and getattr(p, 'BYPASS_HOST_LOOP', None):
 
             # Expose the current hostgroup to the bypassing plugins
@@ -923,3 +978,16 @@ class Runner(object):
         self.background = time_limit
         results = self.run()
         return results, poller.AsyncPoller(results, self)
+
+    # *****************************************************
+
+    def noop_on_check(self, inject):
+        ''' Should the runner run in check mode or not ? '''
+
+        # initialize self.always_run on first call
+        if self.always_run is None:
+            self.always_run = self.module_vars.get('always_run', False)
+            self.always_run = check_conditional(
+                self.always_run, self.basedir, inject, fail_on_undefined=True, jinja2=True)
+
+        return (self.check and not self.always_run)

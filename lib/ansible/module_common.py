@@ -222,6 +222,8 @@ class AnsibleModule(object):
         path = params.get('path', params.get('dest', None))
         if path is None:
             return {}
+        else:
+            path = os.path.expanduser(path)
 
         mode   = params.get('mode', None)
         owner  = params.get('owner', None)
@@ -231,7 +233,7 @@ class AnsibleModule(object):
         seuser    = params.get('seuser', None)
         serole    = params.get('serole', None)
         setype    = params.get('setype', None)
-        selevel   = params.get('serange', 's0')
+        selevel   = params.get('selevel', None)
         secontext = [seuser, serole, setype]
 
         if self.selinux_mls_enabled():
@@ -269,7 +271,7 @@ class AnsibleModule(object):
             if seenabled is not None:
                 (rc,out,err) = self.run_command(seenabled)
                 if rc == 0:
-                    self.fail_json(msg="Aborting, target uses selinux but python bindings (python-selinux) aren't installed!")
+                    self.fail_json(msg="Aborting, target uses selinux but python bindings (libselinux-python) aren't installed!")
             return False
         if selinux.is_selinux_enabled() == 1:
             return True
@@ -307,7 +309,9 @@ class AnsibleModule(object):
             return context
         if ret[0] == -1:
             return context
-        context = ret[1].split(':')
+        # Limit split to 4 because the selevel, the last in the list,
+        # may contain ':' characters
+        context = ret[1].split(':', 3)
         return context
 
     def selinux_context(self, path):
@@ -315,7 +319,7 @@ class AnsibleModule(object):
         if not HAVE_SELINUX or not self.selinux_enabled():
             return context
         try:
-            ret = selinux.lgetfilecon(self._to_filesystem_str(path))
+            ret = selinux.lgetfilecon_raw(self._to_filesystem_str(path))
         except OSError, e:
             if e.errno == errno.ENOENT:
                 self.fail_json(path=path, msg='path %s does not exist' % path)
@@ -323,7 +327,9 @@ class AnsibleModule(object):
                 self.fail_json(path=path, msg='failed to retrieve selinux context')
         if ret[0] == -1:
             return context
-        context = ret[1].split(':')
+        # Limit split to 4 because the selevel, the last in the list,
+        # may contain ':' characters
+        context = ret[1].split(':', 3)
         return context
 
     def user_and_group(self, filename):
@@ -435,7 +441,9 @@ class AnsibleModule(object):
                 else:
                     os.chmod(path, mode)
             except OSError, e:
-                if e.errno == errno.ENOENT: # Can't set mode on broken symbolic links
+                if os.path.islink(path) and e.errno == errno.EPERM:  # Can't set mode on symbolic links
+                    pass
+                elif e.errno == errno.ENOENT: # Can't set mode on broken symbolic links
                     pass
                 else:
                     raise e
@@ -867,8 +875,8 @@ class AnsibleModule(object):
             # Optimistically try a rename, solves some corner cases and can avoid useless work.
             os.rename(src, dest)
         except (IOError,OSError), e:
-            # only try workarounds for errno 18 (cross device) and 1 (not permited)
-            if e.errno != errno.EPERM and e.errno != errno.EXDEV:
+            # only try workarounds for errno 18 (cross device), 1 (not permited) and 13 (permission denied)
+            if e.errno != errno.EPERM and e.errno != errno.EXDEV and e.errno != errno.EACCES:
                 self.fail_json(msg='Could not replace file: %s to %s: %s' % (src, dest, e))
 
             dest_dir = os.path.dirname(dest)

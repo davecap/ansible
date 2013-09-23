@@ -70,14 +70,15 @@ except ImportError:
     pass
 
 ###############################################################
-# abtractions around keyczar
+# Abstractions around keyczar
+###############################################################
 
 def key_for_hostname(hostname):
     # fireball mode is an implementation of ansible firing up zeromq via SSH
     # to use no persistent daemons or key management
 
     if not KEYCZAR_AVAILABLE:
-        raise errors.AnsibleError("python-keyczar must be installed to use fireball mode")
+        raise errors.AnsibleError("python-keyczar must be installed to use fireball/accelerated mode")
 
     key_path = os.path.expanduser("~/.fireball.keys")
     if not os.path.exists(key_path):
@@ -155,19 +156,33 @@ def is_changed(result):
 
     return (result.get('changed', False) in [ True, 'True', 'true'])
 
-def check_conditional(conditional, basedir, inject, fail_on_undefined=False):
+def check_conditional(conditional, basedir, inject, fail_on_undefined=False, jinja2=False):
+
+    if jinja2:
+        conditional = "jinja2_compare %s" % conditional
 
     if conditional.startswith("jinja2_compare"):
         conditional = conditional.replace("jinja2_compare ","")
         # allow variable names
-        if conditional in inject:
+        if conditional in inject and str(inject[conditional]).find('-') == -1:
             conditional = inject[conditional]
         conditional = template.template(basedir, conditional, inject, fail_on_undefined=fail_on_undefined)
         # a Jinja2 evaluation that results in something Python can eval!
-        presented = "{% if " + conditional + " %} True {% else %} False {% endif %}"
+        presented = "{%% if %s %%} True {%% else %%} False {%% endif %%}" % conditional
         conditional = template.template(basedir, presented, inject)
-        val = conditional.lstrip().rstrip()
-        if val == "True":
+        val = conditional.strip()
+        if val == presented:
+            # the templating failed, meaning most likely a 
+            # variable was undefined. If we happened to be 
+            # looking for an undefined variable, return True,
+            # otherwise fail
+            if conditional.find("is undefined") != -1:
+                return True
+            elif conditional.find("is defined") != -1:
+                return False
+            else:
+                raise errors.AnsibleError("error while evaluating conditional: %s" % conditional)
+        elif val == "True":
             return True
         elif val == "False":
             return False
@@ -193,18 +208,34 @@ def is_executable(path):
             or stat.S_IXGRP & os.stat(path)[stat.ST_MODE]
             or stat.S_IXOTH & os.stat(path)[stat.ST_MODE])
 
-def prepare_writeable_dir(tree):
+def unfrackpath(path):
+    ''' 
+    returns a path that is free of symlinks, environment
+    variables, relative path traversals and symbols (~)
+    example:
+    '$HOME/../../var/mail' becomes '/var/spool/mail'
+    '''
+    return os.path.normpath(os.path.realpath(os.path.expandvars(os.path.expanduser(path))))
+
+def prepare_writeable_dir(tree,mode=0777):
     ''' make sure a directory exists and is writeable '''
 
-    if tree != '/':
-        tree = os.path.realpath(os.path.expanduser(tree))
+    # modify the mode to ensure the owner at least
+    # has read/write access to this directory
+    mode |= 0700
+
+    # make sure the tree path is always expanded
+    # and normalized and free of symlinks
+    tree = unfrackpath(tree)
+
     if not os.path.exists(tree):
         try:
-            os.makedirs(tree)
+            os.makedirs(tree, mode)
         except (IOError, OSError), e:
-            exit("Could not make dir %s: %s" % (tree, e))
+            raise errors.AnsibleError("Could not make dir %s: %s" % (tree, e))
     if not os.access(tree, os.W_OK):
-        exit("Cannot write to path %s" % tree)
+        raise errors.AnsibleError("Cannot write to path %s" % tree)
+    return tree
 
 def path_dwim(basedir, given):
     '''
@@ -223,7 +254,11 @@ def path_dwim_relative(original, dirname, source, playbook_base, check=True):
     # (used by roles code)
 
     basedir = os.path.dirname(original)
-    template2 = os.path.join(basedir, '..', dirname, source)
+    if os.path.islink(basedir):
+        basedir = unfrackpath(basedir)
+        template2 = os.path.join(basedir, dirname, source)
+    else:
+        template2 = os.path.join(basedir, '..', dirname, source)
     source2 = path_dwim(basedir, template2)
     if os.path.exists(source2):
         return source2
@@ -353,7 +388,7 @@ def parse_kv(args):
 
 def merge_hash(a, b):
     ''' recursively merges hash b into a
-    keys from b take precedende over keys from a '''
+    keys from b take precedence over keys from a '''
 
     result = copy.deepcopy(a)
 
@@ -373,8 +408,9 @@ def merge_hash(a, b):
 def md5s(data):
     ''' Return MD5 hex digest of data. '''
 
+    buf = StringIO.StringIO(data)
     digest = _md5()
-    digest.update(data.encode('utf-8'))
+    digest.update(buf.read())
     return digest.hexdigest()
 
 def md5(filename):
@@ -473,7 +509,7 @@ def base_parser(constants=C, usage="", output_opts=False, runas_opts=False,
 
     parser = SortedOptParser(usage, version=version("%prog"))
     parser.add_option('-v','--verbose', default=False, action="callback",
-        callback=increment_debug, help="verbose mode (-vvv for more)")
+        callback=increment_debug, help="verbose mode (-vvv for more, -vvvv to enable connection debugging)")
 
     parser.add_option('-f','--forks', dest='forks', default=constants.DEFAULT_FORKS, type='int',
         help="specify number of parallel processes to use (default=%s)" % constants.DEFAULT_FORKS)
@@ -706,6 +742,13 @@ def make_sudo_cmd(sudo_user, executable, cmd):
         prompt, sudo_user, executable or '$SHELL', pipes.quote(cmd))
     return ('/bin/sh -c ' + pipes.quote(sudocmd), prompt)
 
+_TO_UNICODE_TYPES = (unicode, type(None))
+
+def to_unicode(value):
+    if isinstance(value, _TO_UNICODE_TYPES):
+        return value
+    return value.decode("utf-8")
+
 def get_diff(diff):
     # called by --diff usage in playbook and runner via callbacks
     # include names in diffs 'before' and 'after' and do diff -U 10
@@ -731,10 +774,10 @@ def get_diff(diff):
                     after_header = "after: %s" % diff['after_header']
                 else:
                     after_header = 'after'
-                differ = difflib.unified_diff(diff['before'].splitlines(True), diff['after'].splitlines(True), before_header, after_header, '', '', 10)
+                differ = difflib.unified_diff(to_unicode(diff['before']).splitlines(True), to_unicode(diff['after']).splitlines(True), before_header, after_header, '', '', 10)
                 for line in list(differ):
                     ret.append(line)
-            return "".join(ret)
+            return u"".join(ret)
     except UnicodeDecodeError:
         return ">> the files are different, but the diff library cannot compare unicode strings"
 
@@ -778,7 +821,7 @@ def safe_eval(str):
 def listify_lookup_plugin_terms(terms, basedir, inject):
 
     if isinstance(terms, basestring):
-        # somewhat did:
+        # someone did:
         #    with_items: alist
         # OR
         #    with_items: {{ alist }}

@@ -48,12 +48,10 @@ def load_callback_plugins():
     callback_plugins = [x for x in utils.plugins.callback_loader.all()]
 
 def get_cowsay_info():
-    if constants.ANSIBLE_NOCOWS is not None:
+    if constants.ANSIBLE_NOCOWS:
         return (None, None)
     cowsay = None
-    if os.getenv("ANSIBLE_NOCOWS") is not None:
-        cowsay = None
-    elif os.path.exists("/usr/bin/cowsay"):
+    if os.path.exists("/usr/bin/cowsay"):
         cowsay = "/usr/bin/cowsay"
     elif os.path.exists("/usr/games/cowsay"):
         cowsay = "/usr/games/cowsay"
@@ -84,21 +82,30 @@ def log_lockfile():
 LOG_LOCK = open(log_lockfile(), 'w')
 
 def log_flock(runner):
-    fcntl.lockf(LOG_LOCK, fcntl.LOCK_EX)
     if runner is not None:
         try:
             fcntl.lockf(runner.output_lockfile, fcntl.LOCK_EX)
         except OSError:
             # already got closed?
             pass
+    else:
+        try:
+            fcntl.lockf(LOG_LOCK, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        
 
 def log_unflock(runner):
-    fcntl.lockf(LOG_LOCK, fcntl.LOCK_UN)
     if runner is not None:
         try:
             fcntl.lockf(runner.output_lockfile, fcntl.LOCK_UN)
         except OSError:
             # already got closed?
+            pass
+    else:
+        try:
+            fcntl.lockf(LOG_LOCK, fcntl.LOCK_UN)
+        except OSError:
             pass
 
 def set_play(callback, play):
@@ -151,6 +158,9 @@ def vv(msg, host=None):
 def vvv(msg, host=None):
     return verbose(msg, host=host, caplevel=2)
 
+def vvvv(msg, host=None):
+    return verbose(msg, host=host, caplevel=3)
+
 def verbose(msg, host=None, caplevel=2):
     if utils.VERBOSITY > caplevel:
         if host is None:
@@ -182,7 +192,7 @@ class AggregateStats(object):
 
         for (host, value) in runner_results.get('contacted', {}).iteritems():
             if not ignore_errors and (('failed' in value and bool(value['failed'])) or
-                ('rc' in value and value['rc'] != 0)):
+                ('failed_when_result' in value and [value['failed_when_result']] or ['rc' in value and value['rc'] != 0])[0]):
                 self._increment('failures', host)
             elif 'skipped' in value and bool(value['skipped']):
                 self._increment('skipped', host)

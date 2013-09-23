@@ -115,7 +115,8 @@ class Facts(object):
                     '/etc/openwrt_release': 'OpenWrt',
                     '/etc/system-release': 'OtherLinux',
                     '/etc/alpine-release': 'Alpine',
-                    '/etc/release': 'Solaris' }
+                    '/etc/release': 'Solaris',
+                    '/etc/arch-release': 'Archlinux' }
     SELINUX_MODE_DICT = { 1: 'enforcing', 0: 'permissive', -1: 'disabled' }
 
     # A list of dicts.  If there is a platform with more than one
@@ -124,6 +125,7 @@ class Facts(object):
     PKG_MGRS = [ { 'path' : '/usr/bin/yum',         'name' : 'yum' },
                  { 'path' : '/usr/bin/apt-get',     'name' : 'apt' },
                  { 'path' : '/usr/bin/zypper',      'name' : 'zypper' },
+                 { 'path' : '/usr/sbin/urpmi',      'name' : 'urpmi' },
                  { 'path' : '/usr/bin/pacman',      'name' : 'pacman' },
                  { 'path' : '/bin/opkg',            'name' : 'opkg' },
                  { 'path' : '/opt/local/bin/pkgin', 'name' : 'pkgin' },
@@ -145,6 +147,7 @@ class Facts(object):
         self.get_date_time_facts()
         self.get_user_facts()
         self.get_local_facts()
+        self.get_env_facts()
 
     def populate(self):
         return self.facts
@@ -267,6 +270,15 @@ class Facts(object):
             self.facts['distribution'] = 'FreeBSD'
             self.facts['distribution_release'] = platform.release()
             self.facts['distribution_version'] = platform.version()
+        elif self.facts['system'] == 'OpenBSD':
+            self.facts['distribution'] = 'OpenBSD'
+            self.facts['distribution_release'] = platform.release()
+            rc, out, err = module.run_command("/sbin/sysctl -n kern.version")
+            data = re.search('OpenBSD\s[0-9]+.[0-9]+(-\S+)?\s.*', out)
+            if data:
+                self.facts['distribution_version'] = data.groups()[0][1:]
+            else:
+                self.facts['distribution_version'] = 'release'
         else:
             dist = platform.dist()
             self.facts['distribution'] = dist[0].capitalize() or 'NA'
@@ -446,6 +458,10 @@ class Facts(object):
     def get_user_facts(self):
         self.facts['user_id'] = getpass.getuser()
 
+    def get_env_facts(self):
+        self.facts['env'] = {}
+        for k,v in os.environ.iteritems():
+            self.facts['env'][k] = v
 
 class Hardware(Facts):
     """
@@ -1085,26 +1101,27 @@ class AIX(Hardware):
 
 
         rc, out, err = module.run_command("/usr/sbin/lsdev -Cc processor")
-        i = 0
-        for line in out.split('\n'):
+        if out:
+            i = 0
+            for line in out.split('\n'):
 
-            if 'Available' in line:
-                if i == 0:
-                    data = line.split(' ')
-                    cpudev = data[0]
+                if 'Available' in line:
+                    if i == 0:
+                        data = line.split(' ')
+                        cpudev = data[0]
 
-                i += 1
-        self.facts['processor_count'] = int(i)
+                    i += 1
+            self.facts['processor_count'] = int(i)
 
-        rc, out, err = module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a type")
+            rc, out, err = module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a type")
 
-        data = out.split(' ')
-        self.facts['processor'] = data[1]
+            data = out.split(' ')
+            self.facts['processor'] = data[1]
 
-        rc, out, err = module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a smt_threads")
+            rc, out, err = module.run_command("/usr/sbin/lsattr -El " + cpudev + " -a smt_threads")
 
-        data = out.split(' ')
-        self.facts['processor_cores'] = int(data[1])
+            data = out.split(' ')
+            self.facts['processor_cores'] = int(data[1])
 
     def get_memory_facts(self):
         pagesize = 4096
@@ -1122,12 +1139,13 @@ class AIX(Hardware):
         # /dev/ada0p3        314368        0   314368     0%
         #
         rc, out, err = module.run_command("/usr/sbin/lsps -s")
-        lines = out.split('\n')
-        data = lines[1].split()
-        swaptotal_mb = long(data[0].rstrip('MB'))
-        percused = int(data[1].rstrip('%'))
-        self.facts['swaptotal_mb'] = swaptotal_mb
-        self.facts['swapfree_mb'] = long(swaptotal_mb * ( 100 - percused ) / 100)
+        if out:
+            lines = out.split('\n')
+            data = lines[1].split()
+            swaptotal_mb = long(data[0].rstrip('MB'))
+            percused = int(data[1].rstrip('%'))
+            self.facts['swaptotal_mb'] = swaptotal_mb
+            self.facts['swapfree_mb'] = long(swaptotal_mb * ( 100 - percused ) / 100)
 
     def get_dmi_facts(self):
         rc, out, err = module.run_command("/usr/sbin/lsattr -El sys0 -a fwversion")
@@ -1885,6 +1903,13 @@ class LinuxVirtual(Virtual):
             else:
                 self.facts['virtualization_role'] = 'guest'
             return
+
+        if os.path.exists('/proc/1/cgroup'):
+            for line in open('/proc/1/cgroup').readlines():
+                if re.search('/lxc/', line):
+                    self.facts['virtualization_type'] = 'lxc'
+                    self.facts['virtualization_role'] = 'guest'
+                    return
 
         product_name = get_file_content('/sys/devices/virtual/dmi/id/product_name')
 
