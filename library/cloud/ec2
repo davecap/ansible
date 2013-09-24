@@ -581,7 +581,7 @@ def main():
             instance_profile_name = dict(),
             instance_ids = dict(type='list'),
             state = dict(default='present'),
-            ebs_optimized = dict(choices=BOOLEANS, default="no"),
+            ebs_optimized = dict(choices=BOOLEANS, default="no", type='bool'),
         )
     )
 
